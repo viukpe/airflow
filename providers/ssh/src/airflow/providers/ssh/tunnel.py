@@ -54,10 +54,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import selectors
 import socket
 import threading
 import warnings
-from select import select
 from typing import TYPE_CHECKING
 
 from airflow.exceptions import AirflowProviderDeprecationWarning
@@ -248,6 +248,15 @@ class SSHTunnel:
         server_socket = self._server_socket
         shutdown_r = self._shutdown_r
         active_channels: list[tuple[socket.socket, paramiko.Channel]] = []
+
+        # Use selectors (epoll/poll) instead of select.select(). select() cannot
+        # watch a file descriptor numbered >= FD_SETSIZE (1024) and raises
+        # "filedescriptor out of range in select()" once the process holds that
+        # many descriptors, which silently breaks forwarding. selectors has no
+        # such ceiling. The watched set (server socket, shutdown pipe, and the
+        # per-connection local socket + SSH channel) is rebuilt each iteration,
+        # mirroring the previous select() behaviour, because forwarded channels
+        # come and go between iterations.
         try:
             while self._running:
                 read_fds: list[socket.socket | paramiko.Channel] = [server_socket, shutdown_r]
@@ -255,12 +264,25 @@ class SSHTunnel:
                     read_fds.append(local_sock)
                     read_fds.append(chan)
 
+                selector = selectors.DefaultSelector()
                 try:
-                    readable, _, _ = select(read_fds, [], [], 1.0)
-                except (OSError, ValueError):
-                    break
+                    for fileobj in read_fds:
+                        try:
+                            selector.register(fileobj, selectors.EVENT_READ)
+                        except (KeyError, ValueError):
+                            # Already registered (duplicate fileno) or invalid
+                            # (closed) fd -- skip it; closed pairs are pruned
+                            # below.
+                            continue
+                    try:
+                        events = selector.select(timeout=1.0)
+                    except OSError:
+                        break
+                finally:
+                    selector.close()
 
-                for fd in readable:
+                for key, _ in events:
+                    fd = key.fileobj
                     if fd is shutdown_r:
                         return
                     if fd is server_socket:
